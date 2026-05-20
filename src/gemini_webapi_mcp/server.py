@@ -36,88 +36,152 @@ IMAGES_DIR = Path.home() / "Pictures" / "gemini"
 DEFAULT_MODEL = "gemini-3.0-flash"
 
 # ---------------------------------------------------------------------------
-# Watermark removal — Reverse Alpha Blending
-# Algorithm: original = (watermarked - alpha * 255) / (1 - alpha)
-# Credit: AllenK (github.com/allenk/GeminiWatermarkTool, MIT License)
-#         GargantuaX (github.com/GargantuaX/gemini-watermark-remover, MIT License)
+# Watermark removal — Reverse Alpha Blending + NCC anchor search
+# The Gemini sparkle is composited near the bottom-right corner. Its size is
+# fixed (96px for large outputs, 48px for small), but Google renders TWO variants
+# and places each at its own corner margin (measured May 2026):
+#   * portrait/tall outputs (h>w): weaker mark, 192px margin
+#   * square/landscape  (w>=h):    ~1.7x stronger mark, 64px margin
+# So we don't predict the position: a normalized cross-correlation (NCC) anchor
+# search locates the mark exactly, then we undo the exact blend
+#   watermarked = alpha*logo + (1-alpha)*original
+# using the orientation's calibrated map (premult = alpha*logo, plus an alpha map).
+# This removes only the sparkle and preserves whatever content sat under it —
+# no box, no smear, no ghost — on any background or aspect ratio.
+# Recalibrate when Google changes the mark: generate flat black + grey frames
+# (GEMINI_WM_KEEP=1) per orientation and re-derive wm_{alpha,premult}_96[_ls].npy.
 # ---------------------------------------------------------------------------
-_ALPHA_NOISE_FLOOR = 3.0 / 255.0   # ignore quantization noise in alpha map
-_ALPHA_THRESHOLD = 0.002            # skip near-zero alpha pixels
-_MAX_ALPHA = 0.99                   # avoid division by near-zero
-_alpha_maps: dict[int, "np.ndarray"] = {}
+_WM_SEARCH = 288            # px window beyond the logo to scan from the corner
+_WM_MIN_NCC = 0.35          # below this we assume no watermark present
+                            # (textured backgrounds depress NCC to ~0.48)
+_wm_maps: dict[tuple, tuple] = {}   # (size, orient) -> (alpha[h,w], premult[h,w,3])
 
 
-def _load_alpha_map(size: int) -> "np.ndarray":
-    """Load and cache pre-captured alpha map for given watermark size."""
-    if size in _alpha_maps:
-        return _alpha_maps[size]
+def _ncc_best(gray, tmpl):
+    """Best normalized cross-correlation of template over gray (top-left coords).
+
+    Returns (y, x, score). Numerator via FFT, local mean/variance via integral
+    images — standard TM_CCOEFF_NORMED without an OpenCV dependency.
+    """
+    import numpy as np
+    from numpy.fft import rfft2, irfft2
+
+    s = tmpl.shape[0]
+    H, W = gray.shape
+    if H < s or W < s:
+        return 0, 0, -1.0
+    t = tmpl - tmpl.mean()
+    tn = np.sqrt((t * t).sum()) or 1e-6
+    corr = irfft2(rfft2(gray, s=(H, W)) * rfft2(t[::-1, ::-1], s=(H, W)), s=(H, W))
+    num = corr[s - 1:H, s - 1:W]                 # sum(patch * zero-mean-template)
+    ii = np.cumsum(np.cumsum(gray, 0), 1)
+    ii2 = np.cumsum(np.cumsum(gray * gray, 0), 1)
+
+    def ws(I):
+        I = np.pad(I, ((1, 0), (1, 0)))
+        return I[s:, s:] + I[:-s, :-s] - I[s:, :-s] - I[:-s, s:]
+
+    S, S2, n = ws(ii), ws(ii2), s * s
+    # Floor the patch variance: on flat regions (variance ~0) the ratio would
+    # blow up to spurious huge scores, so clamp to a real noise level (std ~2).
+    var = np.maximum(S2 - S * S / n, n * 4.0)
+    ncc = num / (np.sqrt(var) * tn)
+    y, x = np.unravel_index(np.argmax(ncc), ncc.shape)
+    return int(y), int(x), float(ncc.max())
+
+
+def _load_wm_map(size: int, orient: str = "portrait") -> tuple:
+    """Load and cache the (alpha, premult) watermark map for a logo size/orientation.
+
+    Gemini renders a different sparkle for portrait/tall outputs (h>w) than for
+    square/landscape (w>=h) — the latter is ~1.7x stronger with a different edge
+    profile — so each orientation has its own calibrated map. Maps are captured
+    at 96px; smaller sizes are bilinearly downscaled.
+    """
+    key = (size, orient)
+    if key in _wm_maps:
+        return _wm_maps[key]
 
     import numpy as np
     from importlib.resources import files as pkg_files
     from PIL import Image
 
-    base_size = size if size in (48, 96) else 96
-    asset_path = pkg_files("gemini_webapi_mcp.assets").joinpath(f"bg_{base_size}.png")
-    bg = Image.open(asset_path).convert("RGB")
+    suffix = "_ls" if orient == "landscape" else ""
+    assets = pkg_files("gemini_webapi_mcp.assets")
+    with assets.joinpath(f"wm_alpha_96{suffix}.npy").open("rb") as f:
+        alpha = np.load(f)
+    with assets.joinpath(f"wm_premult_96{suffix}.npy").open("rb") as f:
+        premult = np.load(f)
 
-    if base_size != size:
-        bg = bg.resize((size, size), Image.BILINEAR)
+    if size != alpha.shape[0]:
+        alpha = np.asarray(
+            Image.fromarray((alpha * 255.0).astype(np.uint8)).resize((size, size), Image.BILINEAR),
+            dtype=np.float32,
+        ) / 255.0
+        premult = np.asarray(
+            Image.fromarray(np.clip(premult, 0, 255).astype(np.uint8)).resize((size, size), Image.BILINEAR),
+            dtype=np.float32,
+        )
 
-    bg_arr = np.array(bg, dtype=np.float32)
-    alpha_map = np.max(bg_arr, axis=2) / 255.0
-    _alpha_maps[size] = alpha_map
-    return alpha_map
+    _wm_maps[key] = (alpha, premult)
+    return _wm_maps[key]
 
 
 def _remove_watermark(image_path: str) -> bool:
-    """Remove Gemini sparkle watermark using Reverse Alpha Blending.
+    """Remove the Gemini sparkle: NCC anchor search locates it near the
+    bottom-right corner, then reverse alpha blending undoes it exactly —
+    original = (watermarked - alpha*logo) / (1 - alpha) — preserving content.
 
-    Watermark scales with the long side of the image (re-measured May 2026,
-    after Google moved/resized the mark): logo = 4% of long side, placed at an
-    8% margin from the bottom-right corner.
-
-    Returns True if watermark was removed.
+    Returns True if a watermark was found and removed.
     """
+    import os
+    if os.environ.get("GEMINI_WM_KEEP") == "1":   # diagnostic: keep raw watermark
+        return False
+
     import numpy as np
     from PIL import Image
 
     img = Image.open(image_path).convert("RGB")
     w, h = img.size
-
     if w < 200 or h < 200:
         return False
 
-    # Watermark scales with image resolution (measured May 2026):
-    #   logo  = 0.04 * long_side  (96px @ 2400, 48px @ 1200)
-    #   margin = 0.08 * long_side (192px @ 2400, 96px @ 1200) from bottom-right
-    long_side = max(w, h)
-    logo_size = round(0.04 * long_side)
-    margin_right = margin_bottom = round(0.08 * long_side)
+    arr = np.asarray(img, dtype=np.float32)
+    gray = arr.mean(axis=2)
 
-    wm_x = w - margin_right - logo_size
-    wm_y = h - margin_bottom - logo_size
+    # Logo size is fixed by the output resolution (Gemini renders 96px on its
+    # large native outputs, 48px on small ones) — not variable per image, so
+    # picking it by resolution avoids a spurious smaller match outscoring the
+    # real one on textured backgrounds. NCC then locates it (margin varies).
+    # Portrait/tall (h>w) and square/landscape (w>=h) get different watermarks,
+    # placed at different fixed margins (192px vs 64px) — pick the matching map.
+    orient = "portrait" if h > w else "landscape"
+    margin = 192 if h > w else 64
+    size = 96 if max(w, h) >= 1000 else 48
+    win = size + _WM_SEARCH
+    gy0, gx0 = max(0, h - win), max(0, w - win)
+    sub = gray[gy0:, gx0:]
+    alpha, _ = _load_wm_map(size, orient)
+    ry, rx, score = _ncc_best(sub, alpha)
+    y0, x0 = gy0 + ry, gx0 + rx
 
-    if wm_x < 0 or wm_y < 0:
+    if score < _WM_MIN_NCC:
+        logger.info("No watermark detected (best NCC %.3f)", score)
         return False
 
-    alpha_map = _load_alpha_map(logo_size)
-    pixels = np.array(img, dtype=np.float64)
+    # NCC can land 1px off on textured backgrounds, which leaves a faint fringe —
+    # snap to the known margin when NCC agrees, giving pixel-exact registration.
+    dy, dx = h - size - margin, w - size - margin
+    if abs(y0 - dy) <= 6 and abs(x0 - dx) <= 6:
+        y0, x0 = dy, dx
 
-    for row in range(logo_size):
-        for col in range(logo_size):
-            raw_alpha = alpha_map[row, col]
-            if max(0.0, raw_alpha - _ALPHA_NOISE_FLOOR) < _ALPHA_THRESHOLD:
-                continue
+    alpha, premult = _load_wm_map(size, orient)
+    inv = np.clip(1.0 - alpha, 1e-3, 1.0)[..., None]
+    box = arr[y0:y0 + size, x0:x0 + size]
+    arr[y0:y0 + size, x0:x0 + size] = np.clip((box - premult) / inv, 0, 255)
 
-            alpha = min(raw_alpha, _MAX_ALPHA)
-            inv = 1.0 / (1.0 - alpha)
-
-            py = wm_y + row
-            px = wm_x + col
-            for c in range(3):
-                pixels[py, px, c] = max(0.0, min(255.0, (pixels[py, px, c] - alpha * 255.0) * inv))
-
-    Image.fromarray(pixels.astype(np.uint8)).save(image_path)
+    Image.fromarray(arr.astype(np.uint8)).save(image_path)
+    logger.info("Watermark removed (size %d, NCC %.3f) at (%d,%d)", size, score, x0, y0)
     return True
 
 
