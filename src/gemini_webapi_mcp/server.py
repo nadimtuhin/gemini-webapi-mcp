@@ -718,7 +718,10 @@ async def gemini_generate_image(
                     )
                     gen_coro = chat.send_message(prompt, files=resolved_files or None)
                 else:
-                    kwargs = {"model": model or "gemini-3.0-flash-thinking"}
+                    # When _NO_PATCH, omit model entirely so the library uses its
+                    # default (the only mode confirmed to return images without patching).
+                    effective_model = model if model else (None if _NO_PATCH else "gemini-3.0-flash-thinking")
+                    kwargs = {} if effective_model is None else {"model": effective_model}
                     if resolved_files:
                         kwargs["files"] = resolved_files
                     gen_coro = client.generate_content(prompt, **kwargs)
