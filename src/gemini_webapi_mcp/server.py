@@ -60,6 +60,10 @@ _SKIP_2X = os.environ.get("GEMINI_SKIP_2X", "0") != "0"
 # Skip the model-id remap + version bump in patched_request (which forces the
 # slow thinking-advanced model). Set to "1" to send the requested model as-is.
 _NO_REMAP = os.environ.get("GEMINI_NO_REMAP") == "1"
+# Skip ALL request patching (model header, browser body params, extra headers).
+# Falls back to plain generate_content() — slower/lower-res but works when the
+# patched StreamGenerate path is blocked (ImageGenerationBlocked).
+_NO_PATCH = os.environ.get("GEMINI_NO_PATCH") == "1"
 
 
 def _stage(label: str, t0: float) -> float:
@@ -704,7 +708,8 @@ async def gemini_generate_image(
         chat = None
         async with _image_lock:
             t = _stage("acquired image lock", t0)
-            _image_mode = True
+            if not _NO_PATCH:
+                _image_mode = True
             try:
                 if conversation_id:
                     chat = client.start_chat(
