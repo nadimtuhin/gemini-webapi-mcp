@@ -269,8 +269,8 @@ def _patch_client(gemini_client):
         61: [],
         67: 0,
         68: 2,
-        71: 1,
-        72: 1,
+        79: 1,  # browser inner_req_list has 81 elements; 79/80 = 1,1 at end
+        80: 1,
     }
 
     http = gemini_client.client  # curl_cffi.AsyncSession
@@ -299,6 +299,24 @@ def _patch_client(gemini_client):
             headers["x-goog-ext-73010990-jspb"] = "[0,0,0]"
             headers["x-goog-ext-525005358-jspb"] = json.dumps([req_uuid, 1])
 
+            # Browser identity headers required for image generation
+            headers["user-agent"] = "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/148.0.0.0 Safari/537.36"
+            headers["sec-ch-ua"] = '"Chromium";v="148", "Google Chrome";v="148", "Not/A)Brand";v="99"'
+            headers["sec-ch-ua-arch"] = '"arm"'
+            headers["sec-ch-ua-bitness"] = '"64"'
+            headers["sec-ch-ua-form-factors"] = '"Desktop"'
+            headers["sec-ch-ua-full-version"] = '"148.0.7778.179"'
+            headers["sec-ch-ua-full-version-list"] = '"Chromium";v="148.0.7778.179", "Google Chrome";v="148.0.7778.179", "Not/A)Brand";v="99.0.0.0"'
+            headers["sec-ch-ua-mobile"] = "?0"
+            headers["sec-ch-ua-model"] = '""'
+            headers["sec-ch-ua-platform"] = '"macOS"'
+            headers["sec-ch-ua-platform-version"] = '"15.7.3"'
+            headers["sec-ch-ua-wow64"] = "?0"
+            headers["x-browser-channel"] = "stable"
+            headers["x-browser-copyright"] = "Copyright 2026 Google LLC. All Rights Reserved."
+            headers["x-browser-year"] = "2026"
+            headers["x-client-data"] = "CPv8ygE="
+
             kwargs["headers"] = headers
 
             # Inject browser-compatible body params into f.req
@@ -307,11 +325,14 @@ def _patch_client(gemini_client):
                 try:
                     outer = json.loads(data["f.req"])
                     inner = json.loads(outer[1])
+                    # Extend list to browser size if params exceed library's 73 elements
+                    max_idx = max(_BROWSER_PARAMS.keys())
+                    while len(inner) <= max_idx:
+                        inner.append(None)
                     # Force the captured browser values (overwrite, not only-if-None:
                     # the library pre-sets some of these to slow-path values).
                     for idx, val in _BROWSER_PARAMS.items():
-                        if idx < len(inner):
-                            inner[idx] = val
+                        inner[idx] = val
                     # Sync UUID with header
                     inner[59] = req_uuid
 
