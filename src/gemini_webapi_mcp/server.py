@@ -337,8 +337,12 @@ async def _direct_generate_image(prompt: str, model_override: str | None = None)
 
     # --- Pollinations fallback (zero-auth, always available) ---
     # Try early when API key isn't configured or quota exceeded
-    _has_api_key = bool(os.environ.get("GEMINI_API_KEY") or
-                        (Path.home() / ".claude/settings.json").exists())
+    _has_api_key = bool(os.environ.get("GEMINI_API_KEY"))
+    if not _has_api_key:
+        try:
+            _has_api_key = (Path.home() / ".claude/settings.json").exists()
+        except (PermissionError, OSError):
+            pass
     if not _has_api_key:
         try:
             return await _pollinations_generate_image(prompt)
@@ -600,11 +604,8 @@ def _patch_client(gemini_client):
     http = gemini_client.client  # curl_cffi.AsyncSession
     _orig_request = http.request
 
-    _chrome_cookies_injected = False
-
     async def patched_request(method, url, **kwargs):
         global _image_mode, _chrome_image_cookies
-        nonlocal _chrome_cookies_injected
         if method == "POST" and "StreamGenerate" in str(url) and _image_mode:
             headers = kwargs.get("headers") or {}
             # Chrome cookies are sourced from _chrome_image_cookies (set at lifespan).
