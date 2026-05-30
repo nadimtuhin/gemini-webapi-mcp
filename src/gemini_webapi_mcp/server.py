@@ -282,13 +282,15 @@ def _patch_client(gemini_client):
             # both jspb headers AND inner[59], all three must match.
             req_uuid = str(uuid.uuid4()).upper()
 
-            # Replace the model header with the exact browser shape for fast image
-            # generation, rather than string-patching the library's slow header.
-            # Browser: [1,null,null,null,"<id>",null,null,0,[4,5,6,8],null,null,2,null,null,1,1,"<UUID>"]
+            # Exact browser shape captured 2026-05-30 — null model ID (position 4),
+            # null for positions 7/11/14/15. Previous values (56fdd199312815e2 model
+            # id + non-null fields) triggered ImageGenerationBlocked.
+            # Override model ID only if GEMINI_IMAGE_MODEL_ID is explicitly set.
+            model_id_str = ('"' + _IMAGE_MODEL_ID + '"') if os.environ.get("GEMINI_IMAGE_MODEL_ID") else "null"
             if not _NO_REMAP:
                 headers["x-goog-ext-525001261-jspb"] = (
-                    '[1,null,null,null,"' + _IMAGE_MODEL_ID + '",null,null,0,'
-                    + _IMAGE_MODEL_CAPS + ',null,null,2,null,null,1,1,"' + req_uuid + '"]'
+                    '[1,null,null,null,' + model_id_str + ',null,null,null,'
+                    + _IMAGE_MODEL_CAPS + ',null,null,null,null,null,null,null,"' + req_uuid + '"]'
                 )
 
             headers["x-goog-ext-73010989-jspb"] = "[0]"
