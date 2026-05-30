@@ -260,14 +260,17 @@ def _patch_client(gemini_client):
         7: 1,
         10: 1,
         11: 0,
-        17: [[1]],
+        17: [[2]],  # [[1]] blocked image gen; browser sends [[2]] (2026-05-30 capture)
         18: 0,
         27: 1,
         30: [4],
         41: [1],
         53: 0,
         61: [],
+        67: 0,
         68: 2,
+        71: 1,
+        72: 1,
     }
 
     http = gemini_client.client  # curl_cffi.AsyncSession
@@ -278,19 +281,18 @@ def _patch_client(gemini_client):
         if method == "POST" and "StreamGenerate" in str(url) and _image_mode:
             headers = kwargs.get("headers") or {}
 
-            # Per-request UUID — the browser uses an UPPERCASE uuid, embedded in
-            # both jspb headers AND inner[59], all three must match.
+            # Browser uses two separate UUIDs:
+            # - model_uuid: in x-goog-ext-525001261-jspb only
+            # - req_uuid:   in x-goog-ext-525005358-jspb AND inner[59] (must match)
+            model_uuid = str(uuid.uuid4()).upper()
             req_uuid = str(uuid.uuid4()).upper()
 
-            # Exact browser shape captured 2026-05-30 — null model ID (position 4),
-            # null for positions 7/11/14/15. Previous values (56fdd199312815e2 model
-            # id + non-null fields) triggered ImageGenerationBlocked.
-            # Override model ID only if GEMINI_IMAGE_MODEL_ID is explicitly set.
-            model_id_str = ('"' + _IMAGE_MODEL_ID + '"') if os.environ.get("GEMINI_IMAGE_MODEL_ID") else "null"
+            # Browser StreamGenerate shape (2026-05-30 capture): model ID at pos 4,
+            # 0 at pos 7, 2 at pos 11, 1/1 at pos 14/15.
             if not _NO_REMAP:
                 headers["x-goog-ext-525001261-jspb"] = (
-                    '[1,null,null,null,' + model_id_str + ',null,null,null,'
-                    + _IMAGE_MODEL_CAPS + ',null,null,null,null,null,null,null,"' + req_uuid + '"]'
+                    '[1,null,null,null,"' + _IMAGE_MODEL_ID + '",null,null,0,'
+                    + _IMAGE_MODEL_CAPS + ',null,null,2,null,null,1,1,"' + model_uuid + '"]'
                 )
 
             headers["x-goog-ext-73010989-jspb"] = "[0]"
