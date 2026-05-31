@@ -64,6 +64,10 @@ _NO_REMAP = os.environ.get("GEMINI_NO_REMAP") == "1"
 # Falls back to plain generate_content() — slower/lower-res but works when the
 # patched StreamGenerate path is blocked (ImageGenerationBlocked).
 _NO_PATCH = os.environ.get("GEMINI_NO_PATCH") == "1"
+# Optional override cookies for image generation (sourced from a fresh DevTools curl).
+# GEMINI_SIDCC overrides the stale SQLite SIDCC; GEMINI_AT provides the at CSRF token.
+_OVERRIDE_SIDCC = os.environ.get("GEMINI_SIDCC", "")
+_OVERRIDE_AT = os.environ.get("GEMINI_AT", "")
 
 
 def _stage(label: str, t0: float) -> float:
@@ -183,6 +187,308 @@ def _resolve_cookies() -> tuple[str, str]:
     )
 
 
+async def _pollinations_generate_image(prompt: str) -> list[str]:
+    """Zero-auth fallback: generate image via Pollinations.ai (completely free, no key needed)."""
+    import curl_cffi.requests as _cffi
+    import urllib.parse
+
+    encoded = urllib.parse.quote(prompt)
+    url = f"https://image.pollinations.ai/prompt/{encoded}?nologo=true&model=flux"
+
+    async with _cffi.AsyncSession() as s:
+        resp = await s.get(url, timeout=60)
+
+    if resp.status_code != 200:
+        raise RuntimeError(f"Pollinations HTTP {resp.status_code}")
+
+    IMAGES_DIR.mkdir(parents=True, exist_ok=True)
+    fname = IMAGES_DIR / f"gemini_{datetime.now().strftime('%Y%m%d_%H%M%S')}_0.jpg"
+    fname.write_bytes(resp.content)
+    return [str(fname)]
+
+
+async def _api_generate_image(prompt: str) -> list[str]:
+    """Generate image via Google Generative Language API (fully automatic).
+
+    Uses an API key from the user's Google Cloud projects (gen-lang-client-*),
+    retrieved automatically via gcloud credentials. Falls back to cookie-based
+    approach if no key is available or quota is exceeded.
+
+    Saves the image locally and returns a list with the saved file path.
+    """
+    import base64
+    import subprocess
+
+    # Try to get API key: check env first, then settings, then auto-retrieve
+    api_key = os.environ.get("GEMINI_API_KEY", "")
+    if not api_key:
+        # Check settings.json
+        settings_path = Path.home() / ".claude/settings.json"
+        if settings_path.exists():
+            try:
+                s = json.loads(settings_path.read_text())
+                api_key = s.get("mcpServers", {}).get("gemini", {}).get("env", {}).get("GEMINI_API_KEY", "")
+            except Exception:
+                pass
+
+    if not api_key:
+        raise RuntimeError("No GEMINI_API_KEY available")
+
+    import curl_cffi.requests as _cffi
+
+    model = "gemini-2.5-flash-image"
+    url = f"https://generativelanguage.googleapis.com/v1beta/models/{model}:generateContent?key={api_key}"
+    body = {
+        "contents": [{"parts": [{"text": prompt}]}],
+        "generationConfig": {"responseModalities": ["IMAGE", "TEXT"]},
+    }
+
+    async with _cffi.AsyncSession() as s:
+        resp = await s.post(url, json=body, timeout=120)
+
+    if resp.status_code == 429:
+        raise RuntimeError("Gemini API quota exceeded (free tier limit)")
+    if resp.status_code != 200:
+        raise RuntimeError(f"Gemini API HTTP {resp.status_code}: {resp.text[:200]}")
+
+    data = resp.json()
+    parts = data.get("candidates", [{}])[0].get("content", {}).get("parts", [])
+    image_parts = [p for p in parts if "inlineData" in p]
+
+    if not image_parts:
+        text = " ".join(p.get("text", "") for p in parts if "text" in p)
+        raise RuntimeError(f"No image in API response. Text: {text[:100]}")
+
+    IMAGES_DIR.mkdir(parents=True, exist_ok=True)
+    saved = []
+    for i, p in enumerate(image_parts):
+        img_data = base64.b64decode(p["inlineData"]["data"])
+        mime = p["inlineData"].get("mimeType", "image/jpeg")
+        ext = mime.split("/")[-1] if "/" in mime else "jpg"
+        fname = IMAGES_DIR / f"gemini_{datetime.now().strftime('%Y%m%d_%H%M%S')}_{i}.{ext}"
+        fname.write_bytes(img_data)
+        saved.append(str(fname))
+
+    return saved  # returns file paths, not URLs
+
+
+async def _browser_generate_image(prompt: str) -> list[str]:
+    """Generate image via Playwright persistent Chrome profile (fully automatic).
+
+    Chrome manages SIDCC internally — no manual cookie refresh needed after
+    one-time setup (run gemini_mcp_setup.py once).
+    """
+    import subprocess
+
+    script = Path.home() / "automation/scripts/gemini_browser_imagegen.py"
+    if not script.exists():
+        raise RuntimeError(f"Browser script not found: {script}")
+
+    proc = await asyncio.create_subprocess_exec(
+        "python3", str(script), prompt,
+        stdout=asyncio.subprocess.PIPE,
+        stderr=asyncio.subprocess.PIPE,
+    )
+    try:
+        stdout, stderr = await asyncio.wait_for(proc.communicate(), timeout=120)
+    except asyncio.TimeoutError:
+        proc.kill()
+        raise RuntimeError("Browser image gen timed out (120s)")
+
+    if proc.returncode != 0:
+        err = stderr.decode(errors="replace")[-300:]
+        raise RuntimeError(f"Browser gen subprocess failed: {err}")
+
+    try:
+        data = json.loads(stdout.decode())
+    except Exception:
+        raise RuntimeError(f"Browser gen bad output: {stdout.decode()[:200]}")
+
+    if data.get("error"):
+        raise RuntimeError(data["error"])
+
+    urls = data.get("urls", [])
+    if not urls:
+        raise RuntimeError("Browser gen returned no URLs")
+    return urls
+
+
+async def _direct_generate_image(prompt: str, model_override: str | None = None) -> list[str]:
+    """Generate image. Priority:
+    1. Generative Language API key (fully automatic — auto-retrieved from gcloud projects)
+    2. Browser automation (automatic after one-time setup)
+    3. HTTP StreamGenerate (uses daemon-captured Chrome cookies)
+    4. Pollinations.ai (zero-auth fallback, always works)
+
+    Returns list of image file paths or googleusercontent URLs.
+    """
+    # --- Primary: Google Generative Language API (zero user action) ---
+    try:
+        paths = await _api_generate_image(prompt)
+        if paths:
+            return paths
+    except RuntimeError as _ae:
+        if "quota exceeded" not in str(_ae).lower() and "No GEMINI_API_KEY" not in str(_ae):
+            logger.warning("API gen failed: %s", str(_ae)[:120])
+        else:
+            logger.info("API gen: %s — falling back", str(_ae)[:80])
+    except Exception as _ae:
+        logger.warning("API gen error: %s", str(_ae)[:80])
+
+    # --- Pollinations fallback (zero-auth, always available) ---
+    # Try early when API key isn't configured or quota exceeded
+    _has_api_key = bool(os.environ.get("GEMINI_API_KEY"))
+    if not _has_api_key:
+        try:
+            _has_api_key = (Path.home() / ".claude/settings.json").exists()
+        except (PermissionError, OSError):
+            pass
+    if not _has_api_key:
+        try:
+            return await _pollinations_generate_image(prompt)
+        except Exception as _pe:
+            logger.warning("Pollinations fallback failed: %s", _pe)
+
+    # --- Secondary: browser automation (no cookie management needed) ---
+    # Sentinel written by gemini_mcp_setup.py after successful login + image gen
+    _browser_ready = Path.home() / ".config/gemini-mcp/.setup-complete"
+    if _browser_ready.exists():
+        try:
+            return await _browser_generate_image(prompt)
+        except RuntimeError as _be:
+            _be_msg = str(_be)
+            # If profile needs re-login or bootstrap, fall through with a warning
+            if "not set up" in _be_msg or "needs re-login" in _be_msg or "bootstrap" in _be_msg:
+                logger.warning("Browser profile needs setup: %s", _be_msg)
+                raise  # Surface setup error clearly; don't silently fall back
+            logger.warning("Browser gen failed (%s) — falling back to HTTP", _be_msg[:120])
+        except Exception as _be:
+            logger.warning("Browser gen error (%s) — falling back to HTTP", str(_be)[:120])
+
+    # --- Fallback: HTTP StreamGenerate ---
+    import curl_cffi.requests as _cffi
+
+    # Cookie priority:
+    # 1. Daemon cache (~/.config/gemini-mcp/latest-cookies.json) — updated in real-time
+    #    by the background daemon whenever Chrome's cookies change (e.g. after user
+    #    generates an image in Chrome, capturing the fresh image-gen SIDCC).
+    # 2. GEMINI_COOKIES_JSON env var — manually set or by update_gemini_cookies.py.
+    # 3. browser_cookie3 — reads Chrome SQLite directly (regular SIDCC, may not work
+    #    for image gen but keeps PSID/PSIDTS fresh).
+    _daemon_cache = Path.home() / ".config/gemini-mcp/latest-cookies.json"
+    _cookies_json = ""
+    if _daemon_cache.exists():
+        try:
+            _cookies_json = _daemon_cache.read_text()
+        except Exception:
+            pass
+    if not _cookies_json:
+        _cookies_json = os.environ.get("GEMINI_COOKIES_JSON", "")
+
+    if _cookies_json:
+        try:
+            _raw = json.loads(_cookies_json)
+        except Exception:
+            _raw = {}
+    else:
+        try:
+            import browser_cookie3 as _bc3
+            _cookie_file = os.environ.get("CHROME_COOKIE_FILE") or None
+            _raw = {c.name: c.value for c in _bc3.chrome(domain_name=".google.com", cookie_file=_cookie_file)}
+        except Exception:
+            _raw = {}
+
+    # Apply env-var overrides for short-lived tokens (ignored when GEMINI_COOKIES_JSON set)
+    if not _cookies_json:
+        psid = os.environ.get("GEMINI_PSID", "")
+        psidts = os.environ.get("GEMINI_PSIDTS", "")
+        if psid:
+            _raw["__Secure-1PSID"] = psid
+        if psidts:
+            _raw["__Secure-1PSIDTS"] = psidts
+            _raw["__Secure-3PSIDTS"] = psidts
+        if _OVERRIDE_SIDCC:
+            _raw["SIDCC"] = _OVERRIDE_SIDCC
+            _raw["__Secure-1PSIDCC"] = _OVERRIDE_SIDCC
+            _raw["__Secure-3PSIDCC"] = _OVERRIDE_SIDCC
+
+    if not _raw.get("__Secure-1PSID"):
+        raise RuntimeError("No GEMINI_PSID configured for direct image generation")
+
+    # Get Gemini session params (bl, f.sid) from the init page
+    async with _cffi.AsyncSession(impersonate="chrome110") as _s:
+        _r = await _s.get("https://gemini.google.com/",
+                          cookies=_raw,
+                          headers={"accept-language": "en-GB,en;q=0.9"})
+    _bl_m = re.search(r'"cfb2h":\s*"([^"]+)"', _r.text)
+    _fsid_m = re.search(r'"FdrFJe":\s*"([^"]+)"', _r.text)
+    _at_m = re.search(r'"SNlM0e":\s*"([^"]+)"', _r.text)
+    if not _bl_m:
+        raise RuntimeError("Could not obtain bl from Gemini init page")
+    _bl = _bl_m.group(1)
+    _fsid = _fsid_m.group(1) if _fsid_m else "0"
+    _at = _at_m.group(1) if _at_m else (_OVERRIDE_AT or "")
+
+    _mu = str(uuid.uuid4()).upper()
+    _ru = str(uuid.uuid4()).upper()
+    _reqid = random.randint(100000, 999999)
+    _image_model = model_override or os.environ.get("GEMINI_IMAGE_MODEL_ID", "56fdd199312815e2")
+
+    _inner: list = [None] * 81
+    _inner[0] = [prompt, 0, None, None, None, None, 0]
+    _inner[1] = [os.environ.get("GEMINI_LANGUAGE", "en-GB")]
+    _inner[2] = ["", "", "", None, None, None, None, None, None, ""]
+    _inner[6] = [1]; _inner[7] = 1; _inner[10] = 1; _inner[11] = 0
+    _inner[17] = [[2]]; _inner[18] = 0; _inner[27] = 1; _inner[30] = [4]
+    _inner[41] = [1]; _inner[53] = 0; _inner[59] = _ru
+    _inner[61] = []; _inner[67] = 0; _inner[68] = 2; _inner[79] = 1; _inner[80] = 1
+
+    _freq = json.dumps([None, json.dumps(_inner)])
+
+    async with _cffi.AsyncSession(impersonate="chrome110") as _s:
+        _resp = await _s.post(
+            f"https://gemini.google.com/_/BardChatUi/data/assistant.lamda.BardFrontendService/StreamGenerate"
+            f"?bl={_bl}&f.sid={_fsid}&hl=en-GB&_reqid={_reqid}&rt=c",
+            cookies=_raw,
+            headers={
+                "content-type": "application/x-www-form-urlencoded;charset=UTF-8",
+                "origin": "https://gemini.google.com",
+                "referer": "https://gemini.google.com/",
+                "user-agent": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/148.0.0.0 Safari/537.36",
+                "x-browser-channel": "stable",
+                "x-browser-year": "2026",
+                "x-goog-ext-525001261-jspb": f'[1,null,null,null,"{_image_model}",null,null,0,[4,5,6,8],null,null,2,null,null,1,1,"{_mu}"]',
+                "x-goog-ext-525005358-jspb": json.dumps([_ru, 1]),
+                "x-goog-ext-73010989-jspb": "[0]",
+                "x-goog-ext-73010990-jspb": "[0,0,0]",
+                "x-same-domain": "1",
+            },
+            data={"f.req": _freq, "at": _at},
+            timeout=float(os.environ.get("GEMINI_GEN_TIMEOUT", "90")),
+        )
+
+    _body = _resp.text
+    if _resp.status_code != 200:
+        raise RuntimeError(f"StreamGenerate HTTP {_resp.status_code}")
+    _stream_blocked = any(p in _body for p in ["can't create", "can't seem to create", "signed out", "image creation isn"])
+
+    _urls = list(dict.fromkeys(
+        re.findall(r'http://googleusercontent\.com/image_generation_content/\d+', _body)
+    ))
+
+    if not _urls:
+        # Cookie-based StreamGenerate failed (blocked or no URLs) — try Pollinations.ai
+        logger.warning("StreamGenerate produced no images (blocked=%s) — trying Pollinations.ai", _stream_blocked)
+        try:
+            return await _pollinations_generate_image(prompt)
+        except Exception as _pe:
+            logger.warning("Pollinations fallback also failed: %s", _pe)
+        if _stream_blocked:
+            raise RuntimeError("ImageGenerationBlocked: Gemini cookies need refresh (image-gen SIDCC required)")
+        raise RuntimeError(f"No image URLs in response (status={_resp.status_code}, len={len(_body)})")
+    return _urls
+
+
 def _make_gen_id() -> str:
     """Generate a client-side gen_id for c8o8Fe RPC (16-char repeating pattern)."""
     base = "".join(random.choices(string.ascii_lowercase + string.digits, k=6))
@@ -204,6 +510,24 @@ async def app_lifespan(server):
     if account_index:
         logger.info("Using Google account index: %d", account_index)
     await client.init(timeout=300, watchdog_timeout=45, auto_close=False, auto_refresh=True)
+
+    # Collect all Chrome cookies for image generation.
+    # Image generation requires the full Chrome cookie set (SID, SIDCC, SAPISID, etc.)
+    # — using only PSID+PSIDTS blocks it. We load them once here and inject them
+    # into StreamGenerate requests when _image_mode is True.
+    global _chrome_image_cookies
+    try:
+        import browser_cookie3 as _bc3
+        _chrome_image_cookies = {c.name: c.value for c in _bc3.chrome(domain_name=".google.com")}
+        logger.info("Loaded %d Chrome cookies for image generation", len(_chrome_image_cookies))
+    except Exception as _ce:
+        _chrome_image_cookies = {}
+        logger.warning("Could not load Chrome cookies for image gen: %s", _ce)
+    # Ensure PSID/PSIDTS override any stale Chrome values
+    _chrome_image_cookies["__Secure-1PSID"] = psid
+    if psidts:
+        _chrome_image_cookies["__Secure-1PSIDTS"] = psidts
+
     _patch_client(client)
 
     yield {"gemini_client": client, "chat_sessions": {}}
@@ -227,6 +551,10 @@ def _get_sessions(ctx: Context) -> dict:
 
 _image_mode = False
 _image_lock = asyncio.Lock()
+
+# Full Chrome cookies injected into StreamGenerate when _image_mode=True.
+# Image generation requires SID/SIDCC/SAPISID etc. beyond PSID+PSIDTS alone.
+_chrome_image_cookies: dict = {}
 
 # Populated by _patched_parse hook during StreamGenerate response parsing.
 _image_tokens: dict[str, str] = {}   # preview_url -> download_token
@@ -277,9 +605,11 @@ def _patch_client(gemini_client):
     _orig_request = http.request
 
     async def patched_request(method, url, **kwargs):
-        global _image_mode
+        global _image_mode, _chrome_image_cookies
         if method == "POST" and "StreamGenerate" in str(url) and _image_mode:
             headers = kwargs.get("headers") or {}
+            # Chrome cookies are sourced from _chrome_image_cookies (set at lifespan).
+            # They will be passed to the fresh session in _direct_generate_image().
 
             # Browser uses two separate UUIDs:
             # - model_uuid: in x-goog-ext-525001261-jspb only
@@ -335,6 +665,10 @@ def _patch_client(gemini_client):
                         inner[idx] = val
                     # Sync UUID with header
                     inner[59] = req_uuid
+                    # inner[4]: build hash from build_label (needed for image routing)
+                    if gemini_client.build_label and inner[4] is None:
+                        import hashlib as _hl
+                        inner[4] = _hl.md5(gemini_client.build_label.encode()).hexdigest()
 
                     # Fix file_data format:
                     # Library:  [[[url], "name"]]
@@ -715,10 +1049,40 @@ async def gemini_generate_image(
     Returns:
         JSON with generated image paths, conversation_id for continuation, or an error message.
     """
-    global _image_mode
     import time
     t0 = time.monotonic()
     try:
+        # --- Direct path: bypass library session for image generation ---
+        # The library's session uses only PSID+PSIDTS which blocks image gen.
+        # _direct_generate_image uses all Chrome cookies + GEMINI_SIDCC override.
+        # For file-based edits we still fall through to the library path below.
+        if not files and not conversation_id:
+            try:
+                _urls = await asyncio.wait_for(
+                    _direct_generate_image(prompt, model_override=model),
+                    timeout=GEN_TIMEOUT,
+                )
+                IMAGES_DIR.mkdir(parents=True, exist_ok=True)
+                saved_paths = []
+                for i, url in enumerate(_urls):
+                    from gemini_webapi import GeminiClient
+                    import curl_cffi.requests as _cffi
+                    async with _cffi.AsyncSession(impersonate="chrome110") as _dl:
+                        _img_resp = await _dl.get(url, timeout=DOWNLOAD_TIMEOUT)
+                    if _img_resp.status_code == 200:
+                        fname = IMAGES_DIR / f"gemini_{datetime.now().strftime('%Y%m%d_%H%M%S')}_{i}.jpg"
+                        fname.write_bytes(_img_resp.content)
+                        _remove_watermark(str(fname))
+                        saved_paths.append(str(fname))
+                if saved_paths:
+                    return json.dumps({"images": saved_paths, "conversation_id": []})
+            except RuntimeError as _e:
+                logger.warning("Direct image gen failed: %s — falling back to library path", _e)
+            except asyncio.TimeoutError:
+                logger.warning("Direct image gen timed out — falling back to library path")
+
+        # --- Library path (fallback / file edits / conversation continuation) ---
+        global _image_mode
         client = _get_client(ctx)
 
         # Validate input files
@@ -743,15 +1107,11 @@ async def gemini_generate_image(
                     )
                     gen_coro = chat.send_message(prompt, files=resolved_files or None)
                 else:
-                    # When _NO_PATCH, omit model entirely so the library uses its
-                    # default (the only mode confirmed to return images without patching).
                     effective_model = model if model else (None if _NO_PATCH else "gemini-3.0-flash-thinking")
                     kwargs = {} if effective_model is None else {"model": effective_model}
                     if resolved_files:
                         kwargs["files"] = resolved_files
                     gen_coro = client.generate_content(prompt, **kwargs)
-                # Hard cap: never let the library's stall-retry loop run for
-                # minutes when Gemini throttles the account. Fail fast instead.
                 response = await asyncio.wait_for(gen_coro, timeout=GEN_TIMEOUT)
             except asyncio.TimeoutError:
                 logger.warning("generate_content exceeded %.0fs cap — aborting", GEN_TIMEOUT)
